@@ -436,7 +436,7 @@ bool gstEncoder::encodeYUV( void* buffer, size_t size )
 	if( !mNeedData )
 	{
 		LogVerbose(LOG_GSTREAMER "gstEncoder -- pipeline full, skipping frame (%zu bytes)\n", size);
-		return true;
+		return false;
 	}
 
 	// construct the buffer caps for this size image
