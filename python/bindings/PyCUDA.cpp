@@ -46,7 +46,6 @@ static PyObject* PyCudaMemory_New( PyTypeObject *type, PyObject *args, PyObject 
 	if( !self )
 	{
 		PyErr_SetString(PyExc_MemoryError, LOG_PY_UTILS "cudaMemory tp_alloc() failed to allocate a new object");
-		LogError(LOG_PY_UTILS "cudaMemory tp_alloc() failed to allocate a new object\n");
 		return NULL;
 	}
 	
@@ -90,11 +89,7 @@ static int PyCudaMemory_Init( PyCudaMemory* self, PyObject *args, PyObject *kwds
 	static char* kwlist[] = {"size", "mapped", "freeOnDelete", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "i|ii", kwlist, &size, &mapped, &freeOnDelete))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaMemory.__init()__ failed to parse args tuple");
-		LogDebug(LOG_PY_UTILS "cudaMemory.__init()__ failed to parse args tuple\n");
 		return -1;
-	}
     
 	if( size < 0 )
 	{
@@ -175,6 +170,7 @@ static PyGetSetDef pyCudaMemory_GetSet[] =
 	{ "size", (getter)PyCudaMemory_GetSize, NULL, "Size (in bytes)", NULL},
 	{ "mapped", (getter)PyCudaMemory_GetMapped, NULL, "Is the memory mapped to CPU also? (zeroCopy)", NULL},
 	{ "freeOnDelete", (getter)PyCudaMemory_GetFreeOnDelete, NULL, "Will the CUDA memory be released when the Python object is deleted?", NULL},	
+	{ "gpudata", (getter)PyCudaMemory_GetPtr, NULL, "Address of CUDA memory (PyCUDA interface)", NULL},
 	{ NULL } /* Sentinel */
 };
 
@@ -229,7 +225,6 @@ static PyObject* PyCudaImage_New( PyTypeObject *type, PyObject *args, PyObject *
 	if( !self )
 	{
 		PyErr_SetString(PyExc_MemoryError, LOG_PY_UTILS "cudaImage tp_alloc() failed to allocate a new object");
-		LogError(LOG_PY_UTILS "cudaImage tp_alloc() failed to allocate a new object\n");
 		return NULL;
 	}
 	
@@ -246,6 +241,7 @@ static PyObject* PyCudaImage_New( PyTypeObject *type, PyObject *args, PyObject *
 	
 	self->format = IMAGE_UNKNOWN;
 	self->timestamp = 0;
+	self->cudaArrayInterfaceDict = NULL;
 	
 	return (PyObject*)self;
 }
@@ -291,12 +287,8 @@ static int PyCudaImage_Init( PyCudaImage* self, PyObject *args, PyObject *kwds )
 	static char* kwlist[] = {"width", "height", "format", "timestamp", "mapped", "freeOnDelete", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "ii|sLii", kwlist, &width, &height, &formatStr, &timestamp, &mapped, &freeOnDelete))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaImage.__init()__ failed to parse args tuple");
-		LogDebug(LOG_PY_UTILS "cudaImage.__init()__ failed to parse args tuple\n");
 		return -1;
-	}
-    
+
 	if( width < 0 || height < 0 )
 	{
 		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaImage.__init()__ had invalid width/height");
@@ -407,6 +399,75 @@ static PyObject* PyCudaImage_GetFormat( PyCudaImage* self, void* closure )
 static PyObject* PyCudaImage_GetTimestamp( PyCudaImage* self, void* closure )
 {
 	return PYLONG_FROM_UNSIGNED_LONG_LONG(self->timestamp);
+}
+
+// imageFormatToNumpyTypeStr
+static const char* imageFormatToNumpyTypeStr( imageFormat format )
+{
+	// https://docs.scipy.org/doc/numpy-1.13.0/reference/arrays.interface.html#__array_interface__
+	const imageBaseType baseType = imageFormatBaseType(format);
+
+	if( baseType == IMAGE_FLOAT )
+		return "<f4";
+	else if( baseType == IMAGE_UINT8 )
+		return "<u1";
+
+	return "V";
+}
+
+// DICT_SET macro
+#define DICT_SET(dict, key, value) 													\
+	if( PyDict_SetItemString(dict, key, value) != 0 ) 									\
+		return PyErr_Format(PyExc_Exception, LOG_PY_UTILS "failed to set key '%s' in dict", key); \
+	Py_DECREF(value)
+	
+// PyCudaImage_GetCudaArrayInterface
+static PyObject* PyCudaImage_GetCudaArrayInterface( PyCudaImage* self, void* closure )
+{
+	if( self->cudaArrayInterfaceDict != NULL )
+	{
+		Py_INCREF(self->cudaArrayInterfaceDict);
+		return self->cudaArrayInterfaceDict;
+	}
+	
+	LogDebug(LOG_PY_UTILS "PyCudaImage creating __cuda_array_interface__ dict\n");
+	
+	// https://numba.readthedocs.io/en/stable/cuda/cuda_array_interface.html
+	PyObject* dict = PyDict_New();
+	
+	PyObject* shape = PyCudaImage_GetShape(self, closure);
+	PyObject* typestr = PYSTRING_FROM_STRING(imageFormatToNumpyTypeStr(self->format));
+	PyObject* version = PYLONG_FROM_LONG(3);
+	
+	PyObject* data_ptr = PYLONG_FROM_UNSIGNED_LONG_LONG((uint64_t)self->base.ptr);
+	PyObject* data_tuple = PyTuple_Pack(2, data_ptr, Py_False);
+	
+	Py_DECREF(data_ptr);
+
+	// set dictionary keys
+	DICT_SET(dict, "shape", shape);
+	DICT_SET(dict, "typestr", typestr);
+	DICT_SET(dict, "data", data_tuple);
+	DICT_SET(dict, "version", version);
+	
+	Py_INCREF(dict);
+	
+	self->cudaArrayInterfaceDict = dict;
+	return self->cudaArrayInterfaceDict;
+}
+
+// PyCudaImage_GetArrayInterface
+static PyObject* PyCudaImage_GetArrayInterface( PyCudaImage* self, void* closure )
+{
+	if( !self->base.mapped )
+	{
+		LogDebug(LOG_PY_UTILS "PyCudaImage => returning None for __array_interface__ attribute for unmapped buffer");
+		Py_RETURN_NONE;
+	}
+	
+	// https://numpy.org/doc/stable/reference/arrays.interface.html
+	// numpy interface is nearly identical to numba interface
+	return PyCudaImage_GetCudaArrayInterface(self, closure);
 }
 
 // PyCudaImage_ParseSubscriptTuple
@@ -535,24 +596,36 @@ static PyObject* PyCudaImage_GetItem(PyCudaImage *self, PyObject *key)
 	
 	// apply offset to the data pointer
 	uint8_t* ptr = ((uint8_t*)self->base.ptr) + offset;
-
-	// return the pixel as a tuple
-	PyObject* tuple = PyTuple_New(numComponents);
 	const imageBaseType baseType = imageFormatBaseType(self->format);
-
-	for( int n=0; n < numComponents; n++ )
+	
+	if( numComponents > 1 )
 	{
-		PyObject* component = NULL;
-
-		if( baseType == IMAGE_FLOAT )
-			component = PyFloat_FromDouble(((float*)ptr)[n]);
-		else if( baseType == IMAGE_UINT8 )
-			component = PYLONG_FROM_UNSIGNED_LONG(ptr[n]);
+		// return the pixel as a tuple
+		PyObject* tuple = PyTuple_New(numComponents);
 		
-		PyTuple_SetItem(tuple, n, component);
-	}
+		for( int n=0; n < numComponents; n++ )
+		{
+			PyObject* component = NULL;
 
-	return tuple;
+			if( baseType == IMAGE_FLOAT )
+				component = PyFloat_FromDouble(((float*)ptr)[n]);
+			else if( baseType == IMAGE_UINT8 )
+				component = PYLONG_FROM_UNSIGNED_LONG(ptr[n]);
+			
+			PyTuple_SetItem(tuple, n, component);
+		}
+		
+		return tuple;
+	}
+	else
+	{
+		if( baseType == IMAGE_FLOAT )
+			return PyFloat_FromDouble(((float*)ptr)[0]);
+		else if( baseType == IMAGE_UINT8 )
+			return PYLONG_FROM_UNSIGNED_LONG(ptr[0]);
+		else
+			return NULL;  // suppress compiler return warning
+	}
 }
 
 // PyCudaImage_SetItem
@@ -718,6 +791,8 @@ static PyGetSetDef pyCudaImage_GetSet[] =
 	{ "shape", (getter)PyCudaImage_GetShape, NULL, "Image dimensions in (height, width, channels) tuple", NULL},
 	{ "format", (getter)PyCudaImage_GetFormat, NULL, "Pixel format of the image", NULL},
 	{ "timestamp", (getter)PyCudaImage_GetTimestamp, NULL, "Timestamp of the image (in nanoseconds)", NULL},
+	{ "__array_interface__", (getter)PyCudaImage_GetArrayInterface, NULL, "Numpy __array_interface__ dict", NULL},
+	{ "__cuda_array_interface__", (getter)PyCudaImage_GetCudaArrayInterface, NULL, "Numba __cuda_array_interface__ dict", NULL},
 	{ NULL } /* Sentinel */
 };
 
@@ -927,11 +1002,8 @@ PyObject* PyCUDA_Malloc( PyObject* self, PyObject* args, PyObject* kwds )
 	static char* kwlist[] = {"size", "width", "height", "format", "timestamp", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "|iiisL", kwlist, &size, &width, &height, &formatStr, &timestamp))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaMalloc() failed to parse arguments");
 		return NULL;
-	}
-		
+
 	if( size <= 0 && (width <= 0 || height <= 0) )
 	{
 		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaMalloc() requested size/dimensions are negative or zero");
@@ -977,16 +1049,25 @@ PyObject* PyCUDA_AllocMapped( PyObject* self, PyObject* args, PyObject* kwds )
 	float width = 0;
 	float height = 0;
 	long long timestamp = 0;
-
+	PyObject* pyImageLike = NULL;
+	
 	const char* formatStr = NULL;
-	static char* kwlist[] = {"size", "width", "height", "format", "timestamp", NULL};
+	static char* kwlist[] = {"size", "width", "height", "format", "timestamp", "like", NULL};
 
-	if( !PyArg_ParseTupleAndKeywords(args, kwds, "|iffsL", kwlist, &size, &width, &height, &formatStr, &timestamp))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaAllocMapped() failed to parse arguments");
+	if( !PyArg_ParseTupleAndKeywords(args, kwds, "|iffsLO", kwlist, &size, &width, &height, &formatStr, &timestamp, &pyImageLike))
 		return NULL;
-	}
 
+	imageFormat format = imageFormatFromStr(formatStr);
+	
+	if( pyImageLike != NULL )
+	{
+		PyCudaImage* image_like = PyCUDA_GetImage(pyImageLike);
+		
+		width = image_like->width;
+		height = image_like->height;
+		format = image_like->format;
+	}
+	
 	if( size <= 0 && (width <= 0 || height <= 0) )
 	{
 		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaAllocMapped() requested size/dimensions are negative or zero");
@@ -1000,7 +1081,6 @@ PyObject* PyCUDA_AllocMapped( PyObject* self, PyObject* args, PyObject* kwds )
 	}
 
 	const bool isImage = (width > 0) && (height > 0);
-	const imageFormat format = imageFormatFromStr(formatStr);
 
 	if( isImage && format == IMAGE_UNKNOWN )
 	{
@@ -1034,11 +1114,8 @@ PyObject* PyCUDA_Memcpy( PyObject* self, PyObject* args, PyObject* kwds )
 	static char* kwlist[]  = {"dst", "src", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "O|O", kwlist, &dst_capsule, &src_capsule))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaMemcpy() failed to parse arguments");
 		return NULL;
-	}
-	
+
 	// check if the args were reversed in the single-arg version
 	if( !src_capsule && dst_capsule != NULL )
 	{
@@ -1126,11 +1203,8 @@ PyObject* PyCUDA_AdaptFontSize( PyObject* self, PyObject* args )
 	int dim = 0;
 
 	if( !PyArg_ParseTuple(args, "i", &dim) )
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "adaptFontSize() failed to parse size argument");
 		return NULL;
-	}
-		
+
 	if( dim <= 0 )
 	{
 		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "adaptFontSize() requested size is negative or zero");
@@ -1151,10 +1225,7 @@ PyObject* PyCUDA_ConvertColor( PyObject* self, PyObject* args, PyObject* kwds )
 	static char* kwlist[] = {"input", "output", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "OO", kwlist, &pyInput, &pyOutput))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaConvertColor() failed to parse args");
 		return NULL;
-	}
 	
 	// get pointers to image data
 	PyCudaImage* input = PyCUDA_GetImage(pyInput);
@@ -1193,13 +1264,13 @@ PyObject* PyCUDA_Resize( PyObject* self, PyObject* args, PyObject* kwds )
 	PyObject* pyInput  = NULL;
 	PyObject* pyOutput = NULL;
 	
-	static char* kwlist[] = {"input", "output", NULL};
+	const char* filter_str = "point";
+	static char* kwlist[] = {"input", "output", "filter", NULL};
 
-	if( !PyArg_ParseTupleAndKeywords(args, kwds, "OO", kwlist, &pyInput, &pyOutput))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaResize() failed to parse args");
+	if( !PyArg_ParseTupleAndKeywords(args, kwds, "OO|s", kwlist, &pyInput, &pyOutput, &filter_str))
 		return NULL;
-	}
+
+	const cudaFilterMode filter_mode = cudaFilterModeFromStr(filter_str);
 	
 	// get pointers to image data
 	PyCudaImage* input = PyCUDA_GetImage(pyInput);
@@ -1218,7 +1289,7 @@ PyObject* PyCUDA_Resize( PyObject* self, PyObject* args, PyObject* kwds )
 	}
 
 	// run the CUDA function
-	if( CUDA_FAILED(cudaResize(input->base.ptr, input->width, input->height, output->base.ptr, output->width, output->height, output->format)) )
+	if( CUDA_FAILED(cudaResize(input->base.ptr, input->width, input->height, output->base.ptr, output->width, output->height, output->format, filter_mode)) )
 	{
 		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaResize() failed");
 		return NULL;
@@ -1242,11 +1313,8 @@ PyObject* PyCUDA_Crop( PyObject* self, PyObject* args, PyObject* kwds )
 	static char* kwlist[] = {"input", "output", "roi", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "OO(ffff)", kwlist, &pyInput, &pyOutput, &left, &top, &right, &bottom))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaCrop() failed to parse args");
 		return NULL;
-	}
-	
+
 	// get pointers to image data
 	PyCudaImage* input = PyCUDA_GetImage(pyInput);
 	PyCudaImage* output = PyCUDA_GetImage(pyOutput);
@@ -1303,11 +1371,8 @@ PyObject* PyCUDA_Normalize( PyObject* self, PyObject* args, PyObject* kwds )
 	static char* kwlist[] = {"input", "inputRange", "output", "outputRange", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "O(ff)O(ff)", kwlist, &pyInput, &input_min, &input_max, &pyOutput, &output_min, &output_max))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaNormalize() failed to parse args");
 		return NULL;
-	}
-	
+
 	// get pointers to image data
 	PyCudaImage* input = PyCUDA_GetImage(pyInput);
 	PyCudaImage* output = PyCUDA_GetImage(pyOutput);
@@ -1357,11 +1422,8 @@ PyObject* PyCUDA_Overlay( PyObject* self, PyObject* args, PyObject* kwds )
 	static char* kwlist[] = {"input", "output", "x", "y", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "OO|ff", kwlist, &pyInput, &pyOutput, &x, &y))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaOverlay() failed to parse args");
 		return NULL;
-	}
-	
+
 	// get pointers to image data
 	PyCudaImage* input = PyCUDA_GetImage(pyInput);
 	PyCudaImage* output = PyCUDA_GetImage(pyOutput);
@@ -1407,10 +1469,7 @@ PyObject* PyCUDA_DrawCircle( PyObject* self, PyObject* args, PyObject* kwds )
 	static char* kwlist[] = {"input", "center", "radius", "color", "output", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "O(ff)fO|O", kwlist, &pyInput, &x, &y, &radius, &pyColor, &pyOutput))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaDrawCircle() failed to parse arguments");
 		return NULL;
-	}
 	
 	if( !pyOutput )
 		pyOutput = pyInput;
@@ -1441,10 +1500,7 @@ PyObject* PyCUDA_DrawCircle( PyObject* self, PyObject* args, PyObject* kwds )
 	}
 
 	if( !PyArg_ParseTuple(pyColor, "fff|f", &color.x, &color.y, &color.z, &color.w) )
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "failed to parse color tuple");
 		return NULL;
-	}
 
 	// run the CUDA function
 	if( CUDA_FAILED(cudaDrawCircle(input->base.ptr, output->base.ptr, input->width, input->height, input->format, 
@@ -1478,11 +1534,8 @@ PyObject* PyCUDA_DrawLine( PyObject* self, PyObject* args, PyObject* kwds )
 	static char* kwlist[] = {"input", "a", "b", "color", "line_width", "output", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "O(ff)(ff)O|fO", kwlist, &pyInput, &x1, &y1, &x2, &y2, &pyColor, &line_width, &pyOutput))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaDrawLine() failed to parse arguments");
 		return NULL;
-	}
-	
+
 	if( !pyOutput )
 		pyOutput = pyInput;
 	
@@ -1512,10 +1565,7 @@ PyObject* PyCUDA_DrawLine( PyObject* self, PyObject* args, PyObject* kwds )
 	}
 
 	if( !PyArg_ParseTuple(pyColor, "fff|f", &color.x, &color.y, &color.z, &color.w) )
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "failed to parse color tuple");
 		return NULL;
-	}
 
 	// run the CUDA function
 	if( CUDA_FAILED(cudaDrawLine(input->base.ptr, output->base.ptr, input->width, input->height, input->format,
@@ -1538,20 +1588,20 @@ PyObject* PyCUDA_DrawRect( PyObject* self, PyObject* args, PyObject* kwds )
 	PyObject* pyInput  = NULL;
 	PyObject* pyOutput = NULL;
 	PyObject* pyColor  = NULL;
+	PyObject* pyLineColor = NULL;
 	
 	float left = 0.0f;
 	float top = 0.0f;
 	float right = 0.0f;
 	float bottom = 0.0f;
-
-	static char* kwlist[] = {"input", "rect", "color", "output", NULL};
-
-	if( !PyArg_ParseTupleAndKeywords(args, kwds, "O(ffff)O|O", kwlist, &pyInput, &left, &top, &right, &bottom, &pyColor, &pyOutput))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaDrawRect() failed to parse arguments");
-		return NULL;
-	}
 	
+	float line_width = 1.0f;
+	
+	static char* kwlist[] = {"input", "rect", "color", "line_color", "line_width", "output", NULL};
+
+	if( !PyArg_ParseTupleAndKeywords(args, kwds, "O(ffff)|OOfO", kwlist, &pyInput, &left, &top, &right, &bottom, &pyColor, &pyLineColor, &line_width, &pyOutput))
+		return NULL;
+
 	if( !pyOutput )
 		pyOutput = pyInput;
 	
@@ -1572,23 +1622,36 @@ PyObject* PyCUDA_DrawRect( PyObject* self, PyObject* args, PyObject* kwds )
 	}	
 	
 	// parse the color
-	float4 color = make_float4(0, 0, 0, 255);
-	
-	if( !PyTuple_Check(pyColor) )
+	float4 color = make_float4(0,0,0,0);
+
+	if( pyColor != NULL && PyTuple_Check(pyColor) )
+	{
+		if( !PyArg_ParseTuple(pyColor, "fff|f", &color.x, &color.y, &color.z, &color.w) )
+			return NULL;
+	}
+	else if( pyColor != NULL )
 	{
 		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "color argument isn't a valid tuple");
 		return NULL;
 	}
 
-	if( !PyArg_ParseTuple(pyColor, "fff|f", &color.x, &color.y, &color.z, &color.w) )
+	// parse the line color
+	float4 line_color = make_float4(0,0,0,0);
+	
+	if( pyLineColor != NULL && PyTuple_Check(pyLineColor) )
 	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "failed to parse color tuple");
+		if( !PyArg_ParseTuple(pyLineColor, "fff|f", &line_color.x, &line_color.y, &line_color.z, &line_color.w) )
+			return NULL;
+	}
+	else if( pyLineColor != NULL )
+	{
+		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "line_color argument isn't a valid tuple");
 		return NULL;
 	}
 
 	// run the CUDA function
 	if( CUDA_FAILED(cudaDrawRect(input->base.ptr, output->base.ptr, input->width, input->height, input->format,
-						    left, top, right, bottom, color)) )
+						    left, top, right, bottom, color, line_color, line_width)) )
 	{
 		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaDrawRect() failed to render");
 		return NULL;
@@ -1707,11 +1770,8 @@ static int PyFont_Init( PyFont_Object* self, PyObject *args, PyObject *kwds )
 	static char* kwlist[] = {"font", "size", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "|sf", kwlist, &font_name, &font_size))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "pyFont.__init()__ failed to parse args tuple");
 		return -1;
-	}
-  
+
 	// create the font
 	cudaFont* font = cudaFont::Create(font_name, font_size);
 
@@ -1795,14 +1855,12 @@ static PyObject* PyFont_OverlayText( PyFont_Object* self, PyObject* args, PyObje
 	static char* kwlist[] = {"image", "width", "height", "text", "x", "y", "color", "background", "format", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "O|iisiiOOs", kwlist, &input, &width, &height, &text, &x, &y, &color, &bg, &format_str))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaFont.OverlayText() failed to parse function arguments");
 		return NULL;
-	}
 
+	// make sure that text exists
 	if( !text )
 	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaFont.OverlayText() was not passed in a text string");
+		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaFont.OverlayText() needs to be called with the 'text' string argument");
 		return NULL;
 	}
 
@@ -1858,6 +1916,19 @@ static PyObject* PyFont_OverlayText( PyFont_Object* self, PyObject* args, PyObje
 	Py_RETURN_NONE;
 }
 
+// GetSize
+static PyObject* PyFont_GetSize( PyFont_Object* self )
+{
+	if( !self || !self->font )
+	{
+		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "cudaFont invalid object instance");
+		return NULL;
+	}
+	
+	//return PyFloat_FromDouble(self->font->GetSize());
+	return PYLONG_FROM_UNSIGNED_LONG(self->font->GetSize());
+}
+
 static PyTypeObject pyFont_Type = 
 {
     PyVarObject_HEAD_INIT(NULL, 0)
@@ -1866,6 +1937,7 @@ static PyTypeObject pyFont_Type =
 static PyMethodDef pyFont_Methods[] = 
 {
 	{ "OverlayText", (PyCFunction)PyFont_OverlayText, METH_VARARGS|METH_KEYWORDS, "Render the font overlay for a given text string"},
+	{ "GetSize", (PyCFunction)PyFont_GetSize, METH_NOARGS, "Return the size of the font (height in pixels)"},
 	{NULL}  /* Sentinel */
 };
 

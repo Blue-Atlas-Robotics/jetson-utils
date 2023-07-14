@@ -42,6 +42,62 @@ typedef struct {
 
 
 //-------------------------------------------------------------------------------
+// PyURI_ToDict
+static PyObject* PyURI_ToDict( const URI& resource )
+{
+	PyObject* dict = PyDict_New();
+
+	PYDICT_SET_STDSTR(dict, "string", resource.string);
+	PYDICT_SET_STDSTR(dict, "protocol", resource.protocol);
+	PYDICT_SET_STDSTR(dict, "path", resource.path);
+	PYDICT_SET_STDSTR(dict, "extension", resource.extension);
+	PYDICT_SET_STDSTR(dict, "location", resource.location);
+
+	PYDICT_SET_INT(dict, "port", resource.port);
+	
+	return dict;
+}
+
+// PyVideoOptions_ToDict
+static PyObject* PyVideoOptions_ToDict( const videoOptions& options )
+{
+	PyObject* dict = PyDict_New();
+	
+	PYDICT_SET_ITEM(dict, "resource", PyURI_ToDict(options.resource));
+	PYDICT_SET_UINT(dict, "width", options.width);
+	PYDICT_SET_UINT(dict, "height", options.height);
+	PYDICT_SET_FLOAT(dict, "frameRate", options.frameRate);
+	PYDICT_SET_STRING(dict, "codec", videoOptions::CodecToStr(options.codec));
+	
+	if( options.ioType == videoOptions::OUTPUT )
+		PYDICT_SET_UINT(dict, "bitRate", options.bitRate);
+	
+	if( options.ioType == videoOptions::INPUT )
+	{
+		PYDICT_SET_INT(dict, "loop", options.loop);
+		PYDICT_SET_STRING(dict, "flipMethod", videoOptions::FlipMethodToStr(options.flipMethod));
+	}
+
+	PYDICT_SET_UINT(dict, "numBuffers", options.numBuffers);
+	PYDICT_SET_BOOL(dict, "zeroCopy", options.zeroCopy);
+	
+	PYDICT_SET_STRING(dict, "deviceType", videoOptions::DeviceTypeToStr(options.deviceType));
+	PYDICT_SET_STRING(dict, "ioType", videoOptions::IoTypeToStr(options.ioType));
+	
+	if( options.deviceType == videoOptions::DEVICE_IP )
+		PYDICT_SET_INT(dict, "latency", options.latency);
+	
+	if( options.resource.protocol == "webrtc" )
+	{
+		PYDICT_SET_STDSTR(dict, "stunServer", options.stunServer);
+		PYDICT_SET_STDSTR(dict, "sslCert", options.sslCert);
+		PYDICT_SET_STDSTR(dict, "sslKey", options.sslKey);
+	}
+	
+	return dict;
+}
+
+//-------------------------------------------------------------------------------
 // PyVideoSource_New
 static PyObject* PyVideoSource_New( PyTypeObject *type, PyObject *args, PyObject *kwds )
 {
@@ -53,7 +109,6 @@ static PyObject* PyVideoSource_New( PyTypeObject *type, PyObject *args, PyObject
 	if( !self )
 	{
 		PyErr_SetString(PyExc_MemoryError, LOG_PY_UTILS "videoSource tp_alloc() failed to allocate a new object");
-		LogError(LOG_PY_UTILS "videoSource tp_alloc() failed to allocate a new object\n");
 		return NULL;
 	}
 	
@@ -74,11 +129,7 @@ static int PyVideoSource_Init( PyVideoSource_Object* self, PyObject *args, PyObj
 	static char* kwlist[] = {"uri", "argv", "positionArg", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "|sOi", kwlist, &URI, &argList, &positionArg))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "videoSource.__init()__ failed to parse args tuple");
-		LogError(LOG_PY_UTILS "videoSource.__init()__ failed to parse args tuple\n");
 		return -1;
-	}
   
 	// parse argument list
 	size_t argc = 0;
@@ -115,7 +166,9 @@ static int PyVideoSource_Init( PyVideoSource_Object* self, PyObject *args, PyObj
 
 	// create the video source
 	videoSource* source = NULL;
-
+	
+	Py_BEGIN_ALLOW_THREADS
+	
 	if( URI != NULL && strlen(URI) > 0 )
 	{
 		if( argc > 0 )
@@ -127,6 +180,8 @@ static int PyVideoSource_Init( PyVideoSource_Object* self, PyObject *args, PyObj
 	{
 		source = videoSource::Create(argc, argv, positionArg);
 	}
+	
+	Py_END_ALLOW_THREADS
 
 	if( !source )
 	{
@@ -144,11 +199,15 @@ static void PyVideoSource_Dealloc( PyVideoSource_Object* self )
 	LogDebug(LOG_PY_UTILS "PyVideoSource_Dealloc()\n");
 
 	// free the network
+	Py_BEGIN_ALLOW_THREADS
+	
 	if( self->source != NULL )
 	{
 		delete self->source;
 		self->source = NULL;
 	}
+	
+	Py_END_ALLOW_THREADS
 	
 	// free the container
 	Py_TYPE(self)->tp_free((PyObject*)self);
@@ -163,12 +222,15 @@ static PyObject* PyVideoSource_Open( PyVideoSource_Object* self )
 		return NULL;
 	}
 
+	Py_BEGIN_ALLOW_THREADS
+	
 	if( !self->source->Open() )
 	{
 		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "failed to open videoSource device for streaming");
 		return NULL;
 	}
 
+	Py_END_ALLOW_THREADS
 	Py_RETURN_NONE; 
 }
 
@@ -181,7 +243,10 @@ static PyObject* PyVideoSource_Close( PyVideoSource_Object* self )
 		return NULL;
 	}
 
+	Py_BEGIN_ALLOW_THREADS
 	self->source->Close();
+	Py_END_ALLOW_THREADS
+	
 	Py_RETURN_NONE; 
 }
 
@@ -196,35 +261,43 @@ static PyObject* PyVideoSource_Capture( PyVideoSource_Object* self, PyObject* ar
 
 	// parse arguments
 	const char* pyFormat = "rgb8";
-	int pyTimeout = -1;
+	int pyTimeout = videoSource::DEFAULT_TIMEOUT;
 	static char* kwlist[] = {"format", "timeout", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "|si", kwlist, &pyFormat, &pyTimeout))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "videoSource.Capture() failed to parse args tuple");
 		return NULL;
-	}
 
 	// convert signed timeout to unsigned long
-	uint64_t timeout = UINT64_MAX;
+	uint64_t timeout = videoSource::DEFAULT_TIMEOUT;
 
 	if( pyTimeout >= 0 )
 		timeout = pyTimeout;
-
+	else
+		timeout = UINT64_MAX;
+	
 	// convert format string to enum
 	const imageFormat format = imageFormatFromStr(pyFormat);
 	
 	// capture image
 	void* ptr = NULL;
-
-	if( !self->source->Capture(&ptr, format, timeout) )
+	int status = 0;
+	bool result = false;
+	
+	Py_BEGIN_ALLOW_THREADS
+	result = self->source->Capture(&ptr, format, timeout, &status);
+	Py_END_ALLOW_THREADS
+	
+	if( !result )
 	{
+		if( status == videoSource::TIMEOUT )
+			Py_RETURN_NONE;
+		
 		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "videoSource failed to capture image");
 		return NULL;
 	}
 
 	// expect raw image if conversion format is unknown
-	if (format == IMAGE_UNKNOWN)
+	if( format == IMAGE_UNKNOWN )
 	{
 		// register memory capsule (videoSource will free the underlying memory when source is deleted)
 		return PyCUDA_RegisterImage(ptr, self->source->GetWidth(), self->source->GetHeight(), self->source->GetRawFormat(), self->source->GetLastTimestamp(), self->source->GetOptions().zeroCopy, false);
@@ -233,6 +306,7 @@ static PyObject* PyVideoSource_Capture( PyVideoSource_Object* self, PyObject* ar
 	// register memory capsule (videoSource will free the underlying memory when source is deleted)
 	return PyCUDA_RegisterImage(ptr, self->source->GetWidth(), self->source->GetHeight(), format, self->source->GetLastTimestamp(), self->source->GetOptions().zeroCopy, false);
 }
+
 
 // PyVideoSource_GetWidth
 static PyObject* PyVideoSource_GetWidth( PyVideoSource_Object* self )
@@ -270,6 +344,30 @@ static PyObject* PyVideoSource_GetFrameRate( PyVideoSource_Object* self )
 	return PYLONG_FROM_UNSIGNED_LONG(self->source->GetFrameRate());
 }
 
+// PyVideoSource_GetFrameCount
+static PyObject* PyVideoSource_GetFrameCount( PyVideoSource_Object* self )
+{
+	if( !self || !self->source )
+	{
+		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "videoOutput invalid object instance");
+		return NULL;
+	}
+
+	return PYLONG_FROM_UNSIGNED_LONG(self->source->GetFrameCount());
+}
+
+// PyVideoSource_GetOptions
+static PyObject* PyVideoSource_GetOptions( PyVideoSource_Object* self )
+{
+	if( !self || !self->source )
+	{
+		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "videoSource invalid object instance");
+		return NULL;
+	}
+
+	return PyVideoOptions_ToDict(self->source->GetOptions());
+}
+
 // PyVideoSource_IsStreaming
 static PyObject* PyVideoSource_IsStreaming( PyVideoSource_Object* self )
 {
@@ -301,6 +399,8 @@ static PyMethodDef pyVideoSource_Methods[] =
 	{ "GetWidth", (PyCFunction)PyVideoSource_GetWidth, METH_NOARGS, "Return the width of the video source (in pixels)"},
 	{ "GetHeight", (PyCFunction)PyVideoSource_GetHeight, METH_NOARGS, "Return the height of the video source (in pixels)"},
 	{ "GetFrameRate", (PyCFunction)PyVideoSource_GetFrameRate, METH_NOARGS, "Return the frames per second of the video source"},	
+	{ "GetFrameCount", (PyCFunction)PyVideoSource_GetFrameCount, METH_NOARGS, "Return the number of frames captured so far"},
+	{ "GetOptions", (PyCFunction)PyVideoSource_GetOptions, METH_NOARGS, "Return a dict representing the videoOptions of the source"},	
 	{ "IsStreaming", (PyCFunction)PyVideoSource_IsStreaming, METH_NOARGS, "Return true if the stream is open, return false if closed"},
 	{ "Usage", (PyCFunction)PyVideoSource_Usage, METH_NOARGS|METH_STATIC, "Return help text describing the command line options"},		
 	{NULL}  /* Sentinel */
@@ -347,7 +447,6 @@ static PyObject* PyVideoOutput_New( PyTypeObject *type, PyObject *args, PyObject
 	if( !self )
 	{
 		PyErr_SetString(PyExc_MemoryError, LOG_PY_UTILS "videoOutput tp_alloc() failed to allocate a new object");
-		LogError(LOG_PY_UTILS "videoOutput tp_alloc() failed to allocate a new object\n");
 		return NULL;
 	}
 	
@@ -365,15 +464,11 @@ static int PyVideoOutput_Init( PyVideoOutput_Object* self, PyObject *args, PyObj
 	PyObject* argList = NULL;
 	int positionArg = -1;
 	
-	static char* kwlist[] = {"uri", "argv", "positionArg", NULL};
+	static char* kwlist[] = {"uri", "argv", "positionArg", "options", NULL};
 
-	if( !PyArg_ParseTupleAndKeywords(args, kwds, "|sOi", kwlist, &URI, &argList, &positionArg))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "videoOutput.__init()__ failed to parse args tuple");
-		LogError(LOG_PY_UTILS "videoOutput.__init()__ failed to parse args tuple\n");
+	if( !PyArg_ParseTupleAndKeywords(args, kwds, "|sOiO", kwlist, &URI, &argList, &positionArg))
 		return -1;
-	}
-  
+
 	// parse argument list
 	size_t argc = 0;
 	char** argv = NULL;
@@ -414,12 +509,22 @@ static int PyVideoOutput_Init( PyVideoOutput_Object* self, PyObject *args, PyObj
 	// create the video source
 	videoOutput* source = NULL;
 
+	Py_BEGIN_ALLOW_THREADS
+	
 	if( URI != NULL && strlen(URI) > 0 )
 		source = videoOutput::Create(URI, argc, argv);
 	else
 		source = videoOutput::Create(argc, argv, positionArg);
 
+	Py_END_ALLOW_THREADS
+	
 	if( !source )
+	{
+		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "failed to create videoOutput device");
+		return -1;
+	}
+
+	/*if( !source )
 	{
 		//if( headless )
 		//{
@@ -432,7 +537,7 @@ static int PyVideoOutput_Init( PyVideoOutput_Object* self, PyObject *args, PyObj
 			PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "failed to create videoOutput device");
 			return -1;
 		}
-	}
+	}*/
 
 	self->output = source;
 	return 0;
@@ -444,11 +549,15 @@ static void PyVideoOutput_Dealloc( PyVideoOutput_Object* self )
 	LogDebug(LOG_PY_UTILS "PyVideoOutput_Dealloc()\n");
 
 	// free the network
+	Py_BEGIN_ALLOW_THREADS
+	
 	if( self->output != NULL )
 	{
 		delete self->output;
 		self->output = NULL;
 	}
+	
+	Py_END_ALLOW_THREADS
 	
 	// free the container
 	Py_TYPE(self)->tp_free((PyObject*)self);
@@ -463,7 +572,12 @@ static PyObject* PyVideoOutput_Open( PyVideoOutput_Object* self )
 		return NULL;
 	}
 
-	if( !self->output->Open() )
+	bool result = false;
+	Py_BEGIN_ALLOW_THREADS
+	result = self->output->Open();
+	Py_END_ALLOW_THREADS
+	
+	if( !result )
 	{
 		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "failed to open videoOutput device for streaming");
 		return NULL;
@@ -481,7 +595,10 @@ static PyObject* PyVideoOutput_Close( PyVideoOutput_Object* self )
 		return NULL;
 	}
 
+	Py_BEGIN_ALLOW_THREADS
 	self->output->Close();
+	Py_END_ALLOW_THREADS
+	
 	Py_RETURN_NONE; 
 }
 
@@ -500,10 +617,7 @@ static PyObject* PyVideoOutput_Render( PyVideoOutput_Object* self, PyObject* arg
 	static char* kwlist[] = {"image", NULL};
 
 	if( !PyArg_ParseTupleAndKeywords(args, kwds, "O", kwlist, &capsule))
-	{
-		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "videoOutput.Render() failed to parse args tuple");
 		return NULL;
-	}
 
 	// get pointer to image data
 	PyCudaImage* img = PyCUDA_GetImage(capsule);
@@ -515,7 +629,12 @@ static PyObject* PyVideoOutput_Render( PyVideoOutput_Object* self, PyObject* arg
 	}
 
 	// render the image
-	if( !self->output->Render(img->base.ptr, img->width, img->height, img->format) )
+	bool result = false;
+	Py_BEGIN_ALLOW_THREADS
+	result = self->output->Render(img->base.ptr, img->width, img->height, img->format);
+	Py_END_ALLOW_THREADS
+	
+	if( !result )
 	{
 		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "videoOutput failed to render image");
 		return NULL;
@@ -558,6 +677,18 @@ static PyObject* PyVideoOutput_GetFrameRate( PyVideoOutput_Object* self )
 	}
 
 	return PyFloat_FromDouble(self->output->GetFrameRate());
+}
+
+// PyVideoOutput_GetOptions
+static PyObject* PyVideoOutput_GetOptions( PyVideoOutput_Object* self )
+{
+	if( !self || !self->output )
+	{
+		PyErr_SetString(PyExc_Exception, LOG_PY_UTILS "videoOutput invalid object instance");
+		return NULL;
+	}
+
+	return PyVideoOptions_ToDict(self->output->GetOptions());
 }
 
 // PyVideoOutput_IsStreaming
@@ -614,7 +745,8 @@ static PyMethodDef pyVideoOutput_Methods[] =
 	{ "Render", (PyCFunction)PyVideoOutput_Render, METH_VARARGS|METH_KEYWORDS, "Render a frame (supplied as a cudaImage)"},
 	{ "GetWidth", (PyCFunction)PyVideoOutput_GetWidth, METH_NOARGS, "Return the width of the video output (in pixels)"},
 	{ "GetHeight", (PyCFunction)PyVideoOutput_GetHeight, METH_NOARGS, "Return the height of the video output (in pixels)"},
-	{ "GetFrameRate", (PyCFunction)PyVideoOutput_GetFrameRate, METH_NOARGS, "Return the frames per second of the video output"},		
+	{ "GetFrameRate", (PyCFunction)PyVideoOutput_GetFrameRate, METH_NOARGS, "Return the frames per second of the video output"},	
+	{ "GetOptions", (PyCFunction)PyVideoOutput_GetOptions, METH_NOARGS, "Return the dict representation of the videoOptions of the output"},
 	{ "IsStreaming", (PyCFunction)PyVideoOutput_IsStreaming, METH_NOARGS, "Return true if the stream is open, return false if closed"},		
 	{ "SetStatus", (PyCFunction)PyVideoOutput_SetStatus, METH_VARARGS, "Set the status string (i.e. window title bar text)"},
      { "Usage", (PyCFunction)PyVideoOutput_Usage, METH_NOARGS|METH_STATIC, "Return help text describing the command line options"},	
